@@ -1,8 +1,15 @@
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use tauri::{Manager, State};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tauri::{Emitter, Manager, State};
+use tokio::sync::Mutex;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+const POLL_INTERVAL_MS: u64 = 10; // 100Hz
 
 // App Settings
 #[derive(Serialize, Deserialize, Clone)]
@@ -21,11 +28,12 @@ impl Default for Settings {
 pub struct AppState {
     pub settings: Mutex<Settings>,
     pub settings_path: PathBuf,
+    pub polling_active: Arc<AtomicBool>,
 }
 
 impl AppState {
-    fn save_settings(&self) -> Result<(), String> {
-        let settings = self.settings.lock().unwrap();
+    async fn save_settings(&self) -> Result<(), String> {
+        let settings = self.settings.lock().await;
         let json = serde_json::to_string_pretty(&*settings)
             .map_err(|e| format!("Failed to serialize settings: {}", e))?;
         fs::write(&self.settings_path, json)
@@ -42,21 +50,17 @@ impl AppState {
 }
 
 #[tauri::command]
-fn get_settings(state: State<AppState>) -> Settings {
-    state.settings.lock().unwrap().clone()
+async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
+    Ok(state.settings.lock().await.clone())
 }
 
 #[tauri::command]
-fn update_settings(state: State<AppState>, settings: Settings) -> Result<(), String> {
-    *state.settings.lock().unwrap() = settings;
-    state.save_settings()
+async fn update_settings(state: State<'_, AppState>, settings: Settings) -> Result<(), String> {
+    *state.settings.lock().await = settings;
+    state.save_settings().await
 }
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
 
 #[derive(Serialize, Deserialize)]
 struct MoveCommand {
@@ -65,7 +69,7 @@ struct MoveCommand {
     z: f64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct RobotStatus {
     position: Position,
     x_status: String,
@@ -74,7 +78,7 @@ struct RobotStatus {
     status: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct Position {
     x: f64,
     y: f64,
@@ -82,27 +86,86 @@ struct Position {
 }
 
 #[tauri::command]
-async fn connect(state: State<'_, AppState>) -> Result<RobotStatus, String> {
-    let server_url = state.settings.lock().unwrap().server_url.clone();
-    let client = reqwest::Client::new();
-    let url = format!("http://{}/api/position", server_url);
+async fn connect(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<RobotStatus, String> {
+    // Stop any existing polling
+    state.polling_active.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS * 2)).await;
 
-    match client.get(&url).send().await {
-        Ok(response) => {
-            if response.status().is_success() {
-                response
-                    .json::<RobotStatus>()
-                    .await
-                    .map_err(|e| format!("Failed to parse response: {}", e))
-            } else {
-                Err(format!(
-                    "Server responded with status: {}",
-                    response.status()
-                ))
+    let server_url = state.settings.lock().await.server_url.clone();
+    let ws_url = format!("ws://{}/ws", server_url);
+
+    let (ws_stream, _) = connect_async(&ws_url)
+        .await
+        .map_err(|e| format!("Failed to connect to WebSocket: {}", e))?;
+
+    let (mut write, mut read) = ws_stream.split();
+
+    // Get initial status
+    write
+        .send(Message::Text("ping".into()))
+        .await
+        .map_err(|e| format!("Failed to send ping: {}", e))?;
+
+    let initial_status: RobotStatus = loop {
+        match read.next().await {
+            Some(Ok(Message::Text(text))) => {
+                break serde_json::from_str(&text)
+                    .map_err(|e| format!("Failed to parse response: {}", e))?;
+            }
+            Some(Ok(Message::Close(_))) => {
+                return Err("Connection closed".to_string());
+            }
+            Some(Err(e)) => {
+                return Err(format!("WebSocket error: {}", e));
+            }
+            None => {
+                return Err("No response received".to_string());
+            }
+            _ => continue,
+        }
+    };
+
+    // Start polling loop
+    let polling_active = state.polling_active.clone();
+    polling_active.store(true, Ordering::SeqCst);
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(POLL_INTERVAL_MS));
+
+        while polling_active.load(Ordering::SeqCst) {
+            interval.tick().await;
+
+            if write.send(Message::Text("ping".into())).await.is_err() {
+                break;
+            }
+
+            match read.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(status) = serde_json::from_str::<RobotStatus>(&text) {
+                        let _ = app_handle.emit("robot-status", status);
+                    }
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                    break;
+                }
+                _ => continue,
             }
         }
-        Err(e) => Err(format!("Failed to connect: {}", e)),
-    }
+
+        polling_active.store(false, Ordering::SeqCst);
+        let _ = app_handle.emit("robot-disconnected", ());
+    });
+
+    Ok(initial_status)
+}
+
+#[tauri::command]
+async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
+    state.polling_active.store(false, Ordering::SeqCst);
+    Ok(())
 }
 
 #[tauri::command]
@@ -112,7 +175,7 @@ async fn send_go_command(
     y: f64,
     z: f64,
 ) -> Result<String, String> {
-    let server_url = state.settings.lock().unwrap().server_url.clone();
+    let server_url = state.settings.lock().await.server_url.clone();
     let client = reqwest::Client::new();
     let command = MoveCommand { x, y, z };
 
@@ -149,6 +212,7 @@ pub fn run() {
             app.manage(AppState {
                 settings: Mutex::new(settings),
                 settings_path,
+                polling_active: Arc::new(AtomicBool::new(false)),
             });
 
             Ok(())
@@ -157,10 +221,10 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-            greet,
             get_settings,
             update_settings,
             connect,
+            disconnect,
             send_go_command
         ])
         .run(tauri::generate_context!())

@@ -2,13 +2,14 @@
     import { Button } from "$lib/components/ui/button";
     import * as Tabs from "$lib/components/ui/tabs";
     import Telemetry from "$lib/components/Telemetry.svelte";
+    import Sandbox from "$lib/components/Sandbox.svelte";
     import TrajectoryPlot from "$lib/components/TrajectoryPlot.svelte";
     import { open } from "@tauri-apps/plugin-dialog";
     import { readTextFile, BaseDirectory } from "@tauri-apps/plugin-fs";
     import { appDataDir } from "@tauri-apps/api/path";
     import X from "@lucide/svelte/icons/x";
 
-    type Mode = "LIVE" | "REVIEW";
+    type Mode = "LIVE" | "REVIEW" | "SANDBOX";
     let mode = $state<Mode>("LIVE");
 
     type Trajectory = {
@@ -82,6 +83,13 @@
         >
             REVIEW
         </Button>
+        <Button
+            variant={mode === "SANDBOX" ? "default" : "outline"}
+            size="sm"
+            onclick={() => (mode = "SANDBOX")}
+        >
+            SANDBOX
+        </Button>
     </div>
 
     <!-- Content Area -->
@@ -89,6 +97,9 @@
         {#if mode === "LIVE"}
             <!-- LIVE Mode: Single active trajectory -->
             <Telemetry />
+        {:else if mode === "SANDBOX"}
+            <!-- SANDBOX Mode: Ephemeral trajectory visualization -->
+            <Sandbox />
         {:else}
             <!-- REVIEW Mode: Tabs for multiple saved trajectories -->
             <Tabs.Root

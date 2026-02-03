@@ -48,7 +48,10 @@
 <div class="flex flex-col h-full p-4 gap-6">
     <!-- Connection Status -->
     <button
-        onclick={connectionStore.connect}
+        onclick={() =>
+            connectionStore.connected
+                ? connectionStore.disconnect()
+                : connectionStore.connect()}
         disabled={connectionStore.connecting}
         class="flex items-center gap-3 p-3 rounded-lg border bg-card hover:bg-accent/50 transition-colors disabled:opacity-50"
     >
@@ -66,8 +69,8 @@
             {connectionStore.connecting
                 ? "Connecting..."
                 : connectionStore.connected
-                  ? "Connected"
-                  : "Disconnected"}
+                  ? "Connected (click to disconnect)"
+                  : "Disconnected (click to connect)"}
         </span>
     </button>
 

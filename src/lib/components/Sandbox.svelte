@@ -2,30 +2,16 @@
     import { Badge } from "$lib/components/ui/badge";
     import { Button } from "$lib/components/ui/button";
     import TrajectoryPlot from "$lib/components/TrajectoryPlot.svelte";
-    import {
-        writeTextFile,
-        BaseDirectory,
-        mkdir,
-        exists,
-    } from "@tauri-apps/plugin-fs";
     import { connectionStore } from "$lib/stores/connection.svelte";
     import Circle from "@lucide/svelte/icons/circle";
     import CircleArrowRight from "@lucide/svelte/icons/circle-arrow-right";
     import CircleAlert from "@lucide/svelte/icons/circle-alert";
+    import Trash2 from "@lucide/svelte/icons/trash-2";
 
     let plotComponent: TrajectoryPlot;
-    let demoInterval: number | null = null;
-    let demoRunning = $state(false);
-    let recording = $state(false);
-    let t = 0;
 
-    // Trajectory data storage
-    let trajectoryData: {
-        x: number;
-        y: number;
-        z: number;
-        timestamp: number;
-    }[] = [];
+    // Track last known position to detect changes
+    let lastPosition: { x: number; y: number; z: number } | null = null;
 
     // Live data from WebSocket via store
     let currentX = $derived(connectionStore.robotStatus?.position.x ?? 0);
@@ -82,111 +68,27 @@
         }
     }
 
-    // Update trajectory plot when position changes (while recording)
+    // Track position changes and update plot only when position actually changes
     $effect(() => {
-        if (recording && connectionStore.robotStatus) {
+        if (connectionStore.robotStatus) {
             const { x, y, z } = connectionStore.robotStatus.position;
-            trajectoryData.push({ x, y, z, timestamp: Date.now() });
-            plotComponent?.updateTrajectory(x, y, z);
+
+            // Only update if position has actually changed
+            if (
+                lastPosition === null ||
+                x !== lastPosition.x ||
+                y !== lastPosition.y ||
+                z !== lastPosition.z
+            ) {
+                lastPosition = { x, y, z };
+                plotComponent?.updateTrajectory(x, y, z);
+            }
         }
     });
 
-    async function saveTrajectoryToCSV() {
-        if (trajectoryData.length === 0) return;
-
-        // Generate CSV content
-        let csv = "timestamp,x,y,z\n";
-        trajectoryData.forEach((point) => {
-            csv += `${point.timestamp},${point.x.toFixed(2)},${point.y.toFixed(2)},${point.z.toFixed(2)}\n`;
-        });
-
-        // Ensure trajectories directory exists
-        const dirPath = "trajectories";
-        const dirExists = await exists(dirPath, {
-            baseDir: BaseDirectory.AppData,
-        });
-        if (!dirExists) {
-            await mkdir(dirPath, {
-                baseDir: BaseDirectory.AppData,
-                recursive: true,
-            });
-        }
-
-        // Save to app data directory
-        const filename = `trajectories/trajectory_${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
-
-        try {
-            await writeTextFile(filename, csv, {
-                baseDir: BaseDirectory.AppData,
-            });
-
-            // Get the full path for logging
-            const { appDataDir } = await import("@tauri-apps/api/path");
-            const appDataPath = await appDataDir();
-            const fullPath = `${appDataPath}/${filename}`;
-            console.log(`Trajectory saved to: ${fullPath}`);
-        } catch (error) {
-            console.error("Failed to save trajectory:", error);
-        }
-    }
-
-    async function toggleRecording() {
-        if (recording) {
-            // Stop recording
-            recording = false;
-            await saveTrajectoryToCSV();
-        } else {
-            // Start recording
-            recording = true;
-            trajectoryData = [];
-            plotComponent?.clearTrajectory();
-        }
-    }
-
-    async function toggleDemo() {
-        if (demoRunning) {
-            // Stop demo
-            if (demoInterval) clearInterval(demoInterval);
-            demoInterval = null;
-            demoRunning = false;
-
-            // Save trajectory data
-            await saveTrajectoryToCSV();
-        } else {
-            // Start demo
-            demoRunning = true;
-            t = 0;
-            trajectoryData = [];
-
-            // Clear existing trajectory
-            plotComponent?.clearTrajectory();
-
-            // Simulate robot movement
-            demoInterval = setInterval(() => {
-                t += 0.1;
-
-                // Generate spiral trajectory
-                const x = 50 + 30 * Math.cos(t) * (1 + t * 0.1);
-                const y = 50 + 30 * Math.sin(t) * (1 + t * 0.1);
-                const z = 10 + t * 2;
-
-                // Store data point
-                trajectoryData.push({
-                    x,
-                    y,
-                    z,
-                    timestamp: Date.now(),
-                });
-
-                // Update plot
-                plotComponent?.updateTrajectory(x, y, z);
-
-                // Stop after ~10 seconds
-                if (t > 10) {
-                    toggleDemo();
-                }
-            }, 100);
-        }
+    function clearPlot() {
+        plotComponent?.clearTrajectory();
+        lastPosition = null;
     }
 </script>
 
@@ -196,7 +98,7 @@
         <div
             class={`backdrop-blur-sm border-2 rounded-t-lg mx-2 ${
                 connectionStore.connected
-                    ? "bg-background/95 border-teal-500"
+                    ? "bg-background/95 border-orange-500"
                     : "bg-background/95 border-muted-foreground/30"
             }`}
         >
@@ -248,25 +150,21 @@
 
     <!-- Plot Area -->
     <div class="h-full relative">
-        <TrajectoryPlot bind:this={plotComponent} />
+        <TrajectoryPlot bind:this={plotComponent} x={[]} y={[]} z={[]} />
 
-        <!-- Record/Demo Button -->
+        <!-- Clear Button -->
         <div class="absolute top-4 right-4">
-            {#if connectionStore.connected}
-                <Button
-                    onclick={toggleRecording}
-                    variant={recording ? "destructive" : "default"}
-                >
-                    {recording ? "Stop Recording" : "Start Recording"}
-                </Button>
-            {:else}
-                <Button
-                    onclick={toggleDemo}
-                    variant={demoRunning ? "destructive" : "default"}
-                >
-                    {demoRunning ? "Stop Demo" : "Start Demo"}
-                </Button>
-            {/if}
+            <Button onclick={clearPlot} variant="outline" class="gap-2">
+                <Trash2 class="w-4 h-4" />
+                Clear
+            </Button>
+        </div>
+
+        <!-- Sandbox Mode Indicator -->
+        <div class="absolute top-4 left-4">
+            <Badge variant="outline" class="border-orange-500 text-orange-500">
+                Sandbox Mode
+            </Badge>
         </div>
     </div>
 </div>
